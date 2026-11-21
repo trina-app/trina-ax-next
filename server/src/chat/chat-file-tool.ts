@@ -32,7 +32,7 @@ import { cardEndShort, endOfText } from '../policy/refusal'
 import { inSkills } from '../skills/guard'
 import { componentC } from '../team-files/component'
 import { placeProduced } from '../tools/make-file'
-import { CHAT_FILE_MAX, chatFilesOf, seesChatFiles, type ChatFileRow } from './chat-files'
+import { CHAT_FILE_MAX, chainIdOf, chatFilesOf, seesChatFiles, type ChatFileRow } from './chat-files'
 import { neutralizeTags } from './prompt'
 import { addSources, type ReadSource } from './read-scope'
 import type { Tool } from './tools'
@@ -93,7 +93,7 @@ export function chatFileTool(exec: TurnExec): Tool {
     if (!file) return notFound
     named(file.name)
     addSources(rt.db, chatId, [{ type: 'chat', id: chatId }])
-    const head = `The file "${neutralizeTags(oneLine(file.name, 200))}" (${file.mime.split(';')[0]}, ${file.size} bytes, file_id=${file.id}), sent in this chat. ${FILE_NOTE}`
+    const head = `The file "${neutralizeTags(oneLine(file.name, 200))}" (${file.mime.split(';')[0]}, ${file.size} bytes, file_id=${chainIdOf(file)}), sent in this chat. ${FILE_NOTE}`
     if (rt.ctx.files.quarantine.hasHash(file.sha256)) return { ...text(`${head}\nThis file is held by the team's safety check, so it cannot be read here.`, true), summary: 'chat_file -> held' }
     const rel = readName(chatId, file)
     const shown = `"${oneLine(file.name, 200)}"`
@@ -110,7 +110,7 @@ export function chatFileTool(exec: TurnExec): Tool {
       const segs = rel.split('/')
       return { segs, rel, abs: o.abs, exists: true, existing: segs.length, st }
     }
-    const child: SharedChild = { rel, link: shown, id: file.id, open }
+    const child: SharedChild = { rel, link: shown, id: chainIdOf(file), open }
     /** the read's words name the file as the person sees it, never the inner path */
     const swap = (t: string) => t.split(`'${rel}'`).join(shown).split(rel).join(shown)
     const recheck = (pixels: boolean) => {
@@ -152,15 +152,8 @@ export function chatFileTool(exec: TurnExec): Tool {
 /** A file sent in this turn's chat that the person may open (sent in a message, or their own upload not sent yet): by
  * its id, or (`byName`) its exact name, the newest of that name. */
 function findChatFile(exec: TurnExec, ref: string, byName: boolean): ChatFileRow | null {
-  const { rt, spec } = exec
-  const want = ref.trim().replace(/^file_id=/, '')
-  const rows = (byName
-    ? rt.db.query('SELECT * FROM chat_files WHERE chat_id = ? AND (id = ? OR name = ?) ORDER BY created_at DESC').all(spec.chatId, want, want.normalize('NFC'))
-    : rt.db.query('SELECT * FROM chat_files WHERE chat_id = ? AND id = ?').all(spec.chatId, want)) as ChatFileRow[]
-  for (const r of rows) {
-    try { chatFilesOf(rt.ctx).open(spec.userId, spec.chatId, r.id, false); return r } catch { /* not sent, or someone else's unsent one */ }
-  }
-  return null
+  // through the one filtered list (ChatFiles.visibleTo): a chain's newest version, never a name only hidden answers carry
+  return chatFilesOf(exec.rt.ctx).find(exec.spec.userId, exec.spec.chatId, ref, byName)?.head ?? null
 }
 
 /** The calls that only take a file's bytes, by the argument that names the file (chatFileCopyOf): plain content reads
@@ -177,8 +170,8 @@ const BYTE_ONLY_ARGS: Readonly<Record<string, readonly string[]>> = {
  *   - the path is in the person's own folder (users/<them>/), and the newest file event there is the 'create' a
  *     save_chat_file of this chat by this person made, of exactly that chat file (nothing since: no overwrite, rename,
  *     move or restore; an earlier file at the path is never "the copy");
- *   - the chat file was sent in a message (an upload not sent yet is its sender's alone) of this chat, the person sees
- *     the chat now, and the file's bytes now hash to that chat file's sha256 (same size first).
+ *   - the chat file was sent in a message (an upload not sent yet is its sender's alone) of this chat, no answer with a
+ *     k group (a connection's, hidden from newcomers: ChatFiles.kCarried) carries it, the person sees the chat now, and the file's bytes now hash to that chat file's sha256 (same size first).
  * Everyone in the chat already has those bytes, so "split it", "unzip it" after the copy ask nothing new. Anything
  * else, or a check that fails, is false (the card asks as before). A write after this check makes a new file event and
  * is the folder's file from then on.
@@ -200,6 +193,8 @@ export function chatFileCopyOf(ctx: TurnExec['rt']['ctx'], userId: string, chatI
     const f = ctx.db.query('SELECT id, chat_id, sha256, size FROM chat_files WHERE id = ? AND chat_id = ?').get(d.chatFile, chatId) as Pick<ChatFileRow, 'id' | 'chat_id' | 'sha256' | 'size'> | null
     if (!f || f.size !== r.st.size || ev.sha256 !== f.sha256) return false
     if (!seesChatFiles(ctx.db, userId, chatId) || !chatFilesOf(ctx).sent(f) || ctx.files.quarantine.hasHash(f.sha256)) return false
+    // a file a connection's (k) answer carries is not everyone's here: its copy is read as the own folder's (the card)
+    if (chatFilesOf(ctx).kCarried(f)) return false
     return createHash('sha256').update(readRegular(r.abs, CHAT_FILE_MAX, r.st).bytes).digest('hex') === f.sha256
   } catch { return false }
 }
